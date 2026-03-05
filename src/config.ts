@@ -5,8 +5,10 @@ export interface Config {
 	telegramToken: string;
 	workspace: string;
 	sessionDir: string;
-	thinkingLevel: "low" | "medium" | "high";
 	allowedUsers: number[];
+	// Model override (default: from settings.json)
+	piModel: string | null;
+	piThinkingLevel: string | null;
 	// Rate limiting
 	rateLimitCooldownMs: number;
 	// Timeouts
@@ -31,10 +33,10 @@ export function loadConfig(): Config {
 		process.env.MINI_CLAW_SESSION_DIR?.trim() ||
 		join(home, ".mini-claw", "sessions");
 
-	const thinkingLevel = (process.env.PI_THINKING_LEVEL?.trim() || "low") as
-		| "low"
-		| "medium"
-		| "high";
+	// Pi model/thinking can be overridden per-bot via env vars.
+	// If not set, falls back to ~/.pi/agent/settings.json defaults.
+	const piModel = process.env.PI_MODEL?.trim() || null;
+	const piThinkingLevel = process.env.PI_THINKING_LEVEL?.trim() || null;
 
 	const allowedUsers = process.env.ALLOWED_USERS?.trim()
 		? process.env.ALLOWED_USERS.split(",")
@@ -59,12 +61,16 @@ export function loadConfig(): Config {
 		10,
 	);
 
+	if (piModel) console.log(`[config] PI_MODEL=${piModel}`);
+	if (piThinkingLevel) console.log(`[config] PI_THINKING_LEVEL=${piThinkingLevel}`);
+
 	return {
 		telegramToken: token,
 		workspace,
 		sessionDir,
-		thinkingLevel,
 		allowedUsers,
+		piModel,
+		piThinkingLevel,
 		rateLimitCooldownMs,
 		piTimeoutMs,
 		shellTimeoutMs,
