@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Must mock before importing
@@ -50,7 +51,7 @@ describe("config", () => {
 			delete process.env.MINI_CLAW_WORKSPACE;
 			const { loadConfig } = await import("./config.js");
 			const config = loadConfig();
-			expect(config.workspace).toBe("/mock/home/mini-claw-workspace");
+			expect(config.workspace).toBe(join("/mock/home", "mini-claw-workspace"));
 		});
 
 		it("should use custom workspace when MINI_CLAW_WORKSPACE is set", async () => {
@@ -74,7 +75,7 @@ describe("config", () => {
 			delete process.env.MINI_CLAW_SESSION_DIR;
 			const { loadConfig } = await import("./config.js");
 			const config = loadConfig();
-			expect(config.sessionDir).toBe("/mock/home/.mini-claw/sessions");
+			expect(config.sessionDir).toBe(join("/mock/home", ".mini-claw", "sessions"));
 		});
 
 		it("should use custom session directory when MINI_CLAW_SESSION_DIR is set", async () => {
@@ -85,37 +86,7 @@ describe("config", () => {
 			expect(config.sessionDir).toBe("/custom/sessions");
 		});
 
-		it("should use 'low' thinking level by default", async () => {
-			process.env.TELEGRAM_BOT_TOKEN = "test-token";
-			delete process.env.PI_THINKING_LEVEL;
-			const { loadConfig } = await import("./config.js");
-			const config = loadConfig();
-			expect(config.thinkingLevel).toBe("low");
-		});
-
-		it("should accept 'medium' thinking level", async () => {
-			process.env.TELEGRAM_BOT_TOKEN = "test-token";
-			process.env.PI_THINKING_LEVEL = "medium";
-			const { loadConfig } = await import("./config.js");
-			const config = loadConfig();
-			expect(config.thinkingLevel).toBe("medium");
-		});
-
-		it("should accept 'high' thinking level", async () => {
-			process.env.TELEGRAM_BOT_TOKEN = "test-token";
-			process.env.PI_THINKING_LEVEL = "high";
-			const { loadConfig } = await import("./config.js");
-			const config = loadConfig();
-			expect(config.thinkingLevel).toBe("high");
-		});
-
-		it("should trim PI_THINKING_LEVEL", async () => {
-			process.env.TELEGRAM_BOT_TOKEN = "test-token";
-			process.env.PI_THINKING_LEVEL = "  high  ";
-			const { loadConfig } = await import("./config.js");
-			const config = loadConfig();
-			expect(config.thinkingLevel).toBe("high");
-		});
+		// Pi thinking level is inherited from ~/.pi/agent/settings.json — no override in config
 
 		it("should return empty allowedUsers array when ALLOWED_USERS is not set", async () => {
 			process.env.TELEGRAM_BOT_TOKEN = "test-token";
@@ -177,7 +148,6 @@ describe("config", () => {
 			process.env.TELEGRAM_BOT_TOKEN = "test-token";
 			process.env.MINI_CLAW_WORKSPACE = "/workspace";
 			process.env.MINI_CLAW_SESSION_DIR = "/sessions";
-			process.env.PI_THINKING_LEVEL = "high";
 			process.env.ALLOWED_USERS = "123,456";
 			const { loadConfig } = await import("./config.js");
 			const config = loadConfig();
@@ -186,7 +156,6 @@ describe("config", () => {
 				telegramToken: "test-token",
 				workspace: "/workspace",
 				sessionDir: "/sessions",
-				thinkingLevel: "high",
 				allowedUsers: [123, 456],
 				rateLimitCooldownMs: 5000,
 				piTimeoutMs: 300000,

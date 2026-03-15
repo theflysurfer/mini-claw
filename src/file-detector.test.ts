@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock fs/promises
@@ -179,8 +180,8 @@ describe("file-detector", () => {
 			const snapshot = await snapshotWorkspace("/workspace");
 
 			expect(snapshot.size).toBe(2);
-			expect(snapshot.has("/workspace/file1.txt")).toBe(true);
-			expect(snapshot.has("/workspace/file2.pdf")).toBe(true);
+			expect(snapshot.has(join("/workspace", "file1.txt"))).toBe(true);
+			expect(snapshot.has(join("/workspace", "file2.pdf"))).toBe(true);
 		});
 
 		it("should skip directories", async () => {
@@ -193,7 +194,7 @@ describe("file-detector", () => {
 			const snapshot = await snapshotWorkspace("/workspace");
 
 			expect(snapshot.size).toBe(1);
-			expect(snapshot.has("/workspace/file.txt")).toBe(true);
+			expect(snapshot.has(join("/workspace", "file.txt"))).toBe(true);
 		});
 
 		it("should return empty map if directory does not exist", async () => {
@@ -216,22 +217,22 @@ describe("file-detector", () => {
 
 			const newFiles = await detectNewFiles("/workspace", before);
 
-			expect(newFiles).toContain("/workspace/newfile.pdf");
+			expect(newFiles).toContain(join("/workspace", "newfile.pdf"));
 		});
 
 		it("should detect modified files", async () => {
-			const before = new Map<string, number>([["/workspace/file.txt", 1000]]);
+			const before = new Map<string, number>([[join("/workspace", "file.txt"), 1000]]);
 
 			mockReaddir.mockResolvedValue([{ name: "file.txt", isFile: () => true }]);
 			mockStat.mockResolvedValue({ mtimeMs: 2000 }); // Modified
 
 			const newFiles = await detectNewFiles("/workspace", before);
 
-			expect(newFiles).toContain("/workspace/file.txt");
+			expect(newFiles).toContain(join("/workspace", "file.txt"));
 		});
 
 		it("should not detect unchanged files", async () => {
-			const before = new Map<string, number>([["/workspace/file.txt", 1000]]);
+			const before = new Map<string, number>([[join("/workspace", "file.txt"), 1000]]);
 
 			mockReaddir.mockResolvedValue([{ name: "file.txt", isFile: () => true }]);
 			mockStat.mockResolvedValue({ mtimeMs: 1000 }); // Same time

@@ -1,3 +1,4 @@
+import { join, resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Create mock instances
@@ -120,7 +121,7 @@ describe("workspace", () => {
 			const { setWorkspace } = await import("./workspace.js");
 			const result = await setWorkspace(123, "~/projects");
 
-			expect(result).toBe("/mock/home/projects");
+			expect(result).toBe(join("/mock/home", "projects"));
 		});
 
 		it("should resolve relative paths from current workspace", async () => {
@@ -133,7 +134,7 @@ describe("workspace", () => {
 			const { setWorkspace } = await import("./workspace.js");
 			const result = await setWorkspace(123, "subdir");
 
-			expect(result).toBe("/current/workspace/subdir");
+			expect(result).toBe(resolve("/current/workspace", "subdir"));
 		});
 
 		it("should handle absolute paths directly", async () => {
@@ -157,7 +158,7 @@ describe("workspace", () => {
 			const { setWorkspace } = await import("./workspace.js");
 			const result = await setWorkspace(123, "..");
 
-			expect(result).toBe("/current/workspace");
+			expect(result).toBe(resolve("/current/workspace/deep", ".."));
 		});
 
 		it("should throw error when directory does not exist", async () => {
@@ -192,7 +193,7 @@ describe("workspace", () => {
 			await setWorkspace(123, "/new/path");
 
 			expect(mockWriteFile).toHaveBeenCalledWith(
-				"/mock/home/.mini-claw/workspaces.json",
+				join("/mock/home", ".mini-claw", "workspaces.json"),
 				expect.stringContaining("/new/path"),
 			);
 		});
@@ -205,7 +206,7 @@ describe("workspace", () => {
 			const { setWorkspace } = await import("./workspace.js");
 			await setWorkspace(123, "/new/path");
 
-			expect(mockMkdir).toHaveBeenCalledWith("/mock/home/.mini-claw", {
+			expect(mockMkdir).toHaveBeenCalledWith(join("/mock/home", ".mini-claw"), {
 				recursive: true,
 			});
 		});
