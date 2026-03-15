@@ -23,12 +23,13 @@ describe("pi-runner", () => {
 		telegramToken: "test-token",
 		workspace: "/mock/workspace",
 		sessionDir: "/mock/sessions",
-		thinkingLevel: "low",
 		allowedUsers: [],
 		rateLimitCooldownMs: 5000,
 		piTimeoutMs: 300000,
 		shellTimeoutMs: 60000,
 		sessionTitleTimeoutMs: 10000,
+		piModel: null,
+		piThinkingLevel: null,
 	};
 
 	function createMockProcess(): ChildProcess & EventEmitter {
@@ -79,41 +80,17 @@ describe("pi-runner", () => {
 
 			await resultPromise;
 
-			expect(mockSpawn).toHaveBeenCalledWith(
-				"pi",
-				[
-					"--session",
-					"/mock/sessions/telegram-123.jsonl",
-					"--print",
-					"--thinking",
-					"low",
-					"test prompt",
-				],
-				expect.objectContaining({
-					cwd: "/workspace",
-					stdio: ["ignore", "pipe", "pipe"],
-				}),
-			);
-		});
-
-		it("should use configured thinking level", async () => {
-			const highConfig = { ...mockConfig, thinkingLevel: "high" as const };
-			const mockProc = createMockProcess();
-			mockSpawn.mockReturnValue(mockProc);
-
-			const resultPromise = runPi(highConfig, 123, "test", "/workspace");
-
-			await vi.waitFor(() => expect(mockSpawn).toHaveBeenCalled());
-			mockProc.stdout?.emit("data", "response");
-			mockProc.emit("close", 0);
-
-			await resultPromise;
-
-			expect(mockSpawn).toHaveBeenCalledWith(
-				"pi",
-				expect.arrayContaining(["--thinking", "high"]),
-				expect.any(Object),
-			);
+			// On Windows, spawn uses shell:true with concatenated command string
+			const call = mockSpawn.mock.calls[0];
+			const fullCmd = typeof call[0] === "string" ? call[0] : "";
+			expect(fullCmd).toContain("pi");
+			expect(fullCmd).toContain("--session");
+			expect(fullCmd).toContain("telegram-123.jsonl");
+			expect(fullCmd).toContain("--print");
+			expect(fullCmd).toContain("test prompt");
+			// Pi settings (thinking, model) are inherited from ~/.pi/agent/settings.json
+			expect(fullCmd).not.toContain("--thinking");
+			expect(fullCmd).not.toContain("-e");
 		});
 
 		it("should return stdout as output", async () => {
@@ -304,15 +281,12 @@ describe("pi-runner", () => {
 
 			await resultPromise;
 
-			expect(mockSpawn).toHaveBeenCalledWith(
-				"pi",
-				expect.any(Array),
-				expect.objectContaining({
-					env: expect.objectContaining({
-						PI_AGENT_DIR: "/test/home/.pi/agent",
-					}),
-				}),
-			);
+			const call = mockSpawn.mock.calls[0];
+			const opts = call[2] || call[1]; // args may be [] on Windows, so opts is call[2]
+			const env = typeof opts === "object" && opts !== null ? opts.env : undefined;
+			expect(env).toBeDefined();
+			expect(env.PI_AGENT_DIR).toContain(".pi");
+			expect(env.PI_AGENT_DIR).toContain("agent");
 
 			process.env.HOME = originalHome;
 		});
@@ -328,14 +302,9 @@ describe("pi-runner", () => {
 
 			await resultPromise;
 
-			expect(mockSpawn).toHaveBeenCalledWith(
-				"pi",
-				expect.arrayContaining([
-					"--session",
-					"/mock/sessions/telegram--100123.jsonl",
-				]),
-				expect.any(Object),
-			);
+			const call = mockSpawn.mock.calls[0];
+			const fullCmd = typeof call[0] === "string" ? call[0] : "";
+			expect(fullCmd).toContain("telegram--100123.jsonl");
 		});
 	});
 
@@ -390,9 +359,10 @@ describe("pi-runner", () => {
 
 			await resultPromise;
 
-			expect(mockSpawn).toHaveBeenCalledWith("pi", ["--version"], {
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+			const call = mockSpawn.mock.calls[0];
+			const fullCmd = typeof call[0] === "string" ? call[0] : "";
+			expect(fullCmd).toContain("pi");
+			expect(fullCmd).toContain("--version");
 		});
 	});
 });

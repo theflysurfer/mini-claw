@@ -2,11 +2,14 @@ import { spawn } from "node:child_process";
 import { Bot, InlineKeyboard, InputFile } from "grammy";
 import type { Config } from "./config.js";
 import { detectFiles, snapshotWorkspace } from "./file-detector.js";
+import { logger, Timer } from "./logger.js";
 import { markdownToHtml, stripMarkdown } from "./markdown.js";
 import {
 	type ActivityUpdate,
 	acquireLock,
 	checkPiAuth,
+	initPi,
+	resetSession,
 	runPiWithStreaming,
 } from "./pi-runner.js";
 import { checkRateLimit } from "./rate-limiter.js";
@@ -20,6 +23,11 @@ import {
 	listSessions,
 	switchSession,
 } from "./sessions.js";
+import {
+	downloadTelegramFile,
+	isTranscriberReady,
+	transcribe,
+} from "./transcriber.js";
 import { formatPath, getWorkspace, setWorkspace } from "./workspace.js";
 
 interface ShellResult {
@@ -135,7 +143,7 @@ export function createBot(config: Config): Bot {
 
 	// /start command
 	bot.command("start", async (ctx) => {
-		const piOk = await checkPiAuth();
+		const piOk = await initPi();
 		const status = piOk
 			? "Pi is ready"
 			: "Pi is not installed or not authenticated";
@@ -371,6 +379,148 @@ Send any message to chat with AI.`,
 		);
 	});
 
+	// Handle voice messages — transcribe and forward to AI
+	bot.on(["message:voice", "message:audio", "message:video_note"], async (ctx) => {
+		const chatId = ctx.chat.id;
+
+		// Rate limiting check
+		const rateLimit = checkRateLimit(chatId, config.rateLimitCooldownMs);
+		if (!rateLimit.allowed) {
+			const seconds = Math.ceil((rateLimit.retryAfterMs || 0) / 1000);
+			await ctx.reply(`⏳ Please wait ${seconds}s before sending another message.`);
+			return;
+		}
+
+		// Check if transcriber is available
+		const ready = await isTranscriberReady();
+		if (!ready) {
+			await ctx.reply("🎤 Voice transcription is not available (server offline).");
+			return;
+		}
+
+		// Get file_id from voice, audio, or video_note
+		const voice = ctx.message.voice;
+		const audio = ctx.message.audio;
+		const videoNote = ctx.message.video_note;
+		const fileId = voice?.file_id || audio?.file_id || videoNote?.file_id;
+		const duration = voice?.duration || audio?.duration || videoNote?.duration || 0;
+
+		if (!fileId) {
+			await ctx.reply("Could not process this media.");
+			return;
+		}
+
+		const statusMsg = await ctx.reply(`🎤 Transcribing voice (${duration}s)...`);
+		await ctx.replyWithChatAction("typing");
+
+		try {
+			// Download audio from Telegram
+			const audioBuffer = await downloadTelegramFile(config.telegramToken, fileId);
+
+			// Determine MIME type
+			const mimeType = voice?.mime_type || audio?.mime_type || "audio/ogg";
+
+			// Transcribe
+			const result = await transcribe(audioBuffer, mimeType);
+
+			// Delete status message
+			try {
+				await ctx.api.deleteMessage(chatId, statusMsg.message_id);
+			} catch {
+				// Ignore
+			}
+
+			if (!result.text || result.text.trim().length === 0) {
+				await ctx.reply("🎤 (empty — no speech detected)");
+				return;
+			}
+
+			// Send transcription
+			const meta = `⏱ ${result.durationProcessing}s | 🌍 ${result.language}`;
+			await ctx.reply(`🎤 ${result.text}\n\n<i>${meta}</i>`, { parse_mode: "HTML" });
+
+			// Also forward the transcribed text to Pi as if the user typed it
+			// This way voice messages participate in the AI conversation
+			const caption = ctx.message.caption;
+			const textForPi = caption
+				? `[Voice message] ${result.text}\n[Caption] ${caption}`
+				: `[Voice message] ${result.text}`;
+
+			// Get current workspace for this chat
+			const workspace = await getWorkspace(chatId);
+			const beforeSnapshot = await snapshotWorkspace(workspace);
+
+			const piStatusMsg = await ctx.reply("🔄 Processing...");
+			let lastStatusUpdate = Date.now();
+
+			const activityEmoji: Record<string, string> = {
+				thinking: "🧠", reading: "📖", writing: "✍️",
+				running: "⚡", searching: "🔍", working: "🔄",
+			};
+
+			const onActivity = async (activity: ActivityUpdate) => {
+				const now = Date.now();
+				if (now - lastStatusUpdate < 2000) return;
+				lastStatusUpdate = now;
+				try {
+					const emoji = activityEmoji[activity.type] || "🔄";
+					await ctx.api.editMessageText(
+						chatId, piStatusMsg.message_id,
+						`${emoji} Working... (${activity.elapsed}s)${activity.detail ? `\n└─ ${activity.detail}` : ""}`,
+					);
+				} catch { /* ignore */ }
+			};
+
+			const typingInterval = setInterval(() => {
+				ctx.replyWithChatAction("typing").catch(() => {});
+			}, 4000);
+
+			try {
+				const piResult = await runPiWithStreaming(config, chatId, textForPi, workspace, onActivity);
+				clearInterval(typingInterval);
+
+				try { await ctx.api.deleteMessage(chatId, piStatusMsg.message_id); } catch { /* ignore */ }
+
+				if (piResult.error) {
+					await ctx.reply(`Error: ${piResult.error}`);
+				}
+				if (piResult.output) {
+					const chunks = splitMessage(piResult.output.trim());
+					for (const chunk of chunks) {
+						try {
+							await ctx.reply(markdownToHtml(chunk), { parse_mode: "HTML" });
+						} catch {
+							await ctx.reply(stripMarkdown(chunk));
+						}
+					}
+				}
+
+				const detectedFiles = await detectFiles(piResult.output || "", workspace, beforeSnapshot);
+				for (const file of detectedFiles) {
+					try {
+						if (file.type === "photo") {
+							await ctx.replyWithPhoto(new InputFile(file.path), { caption: file.filename });
+						} else {
+							await ctx.replyWithDocument(new InputFile(file.path), { caption: file.filename });
+						}
+					} catch {
+						await ctx.reply(`(Could not send file: ${file.filename})`);
+					}
+				}
+			} catch (err) {
+				clearInterval(typingInterval);
+				try { await ctx.api.deleteMessage(chatId, piStatusMsg.message_id); } catch { /* ignore */ }
+				const errorMsg = err instanceof Error ? err.message : "Unknown error";
+				await ctx.reply(`Failed to process: ${errorMsg}`);
+			}
+
+		} catch (err) {
+			try { await ctx.api.deleteMessage(chatId, statusMsg.message_id); } catch { /* ignore */ }
+			const errorMsg = err instanceof Error ? err.message : "Unknown error";
+			await ctx.reply(`🎤 Transcription failed: ${errorMsg}`);
+		}
+	});
+
 	// Handle all text messages
 	bot.on("message:text", async (ctx) => {
 		const chatId = ctx.chat.id;
@@ -381,10 +531,14 @@ Send any message to chat with AI.`,
 			return;
 		}
 
+		const msgTimer = new Timer("msg", `text from ${ctx.from?.username || chatId}`);
+		logger.info("msg", `📩 "${text.slice(0, 150)}${text.length > 150 ? "..." : ""}"`, { chatId, from: ctx.from?.username, len: text.length });
+
 		// Rate limiting check
 		const rateLimit = checkRateLimit(chatId, config.rateLimitCooldownMs);
 		if (!rateLimit.allowed) {
 			const seconds = Math.ceil((rateLimit.retryAfterMs || 0) / 1000);
+			logger.info("msg", `Rate limited chat ${chatId}, ${seconds}s remaining`);
 			await ctx.reply(
 				`⏳ Please wait ${seconds}s before sending another message.`,
 			);
@@ -393,9 +547,11 @@ Send any message to chat with AI.`,
 
 		// Get current workspace for this chat
 		const workspace = await getWorkspace(chatId);
+		msgTimer.lap("workspace");
 
 		// Snapshot workspace before Pi execution
 		const beforeSnapshot = await snapshotWorkspace(workspace);
+		msgTimer.lap("snapshot");
 
 		// Send initial status message that we'll update
 		const statusMsg = await ctx.reply("🔄 Working...");
@@ -501,6 +657,8 @@ Send any message to chat with AI.`,
 					await ctx.reply(`(Could not send file: ${file.filename})`);
 				}
 			}
+			msgTimer.lap("reply-sent");
+			msgTimer.done(`${result.output?.length || 0}B response`);
 		} catch (err) {
 			clearInterval(typingInterval);
 			// Try to delete status message on error too
@@ -510,6 +668,7 @@ Send any message to chat with AI.`,
 				// Ignore
 			}
 			const errorMsg = err instanceof Error ? err.message : "Unknown error";
+			logger.error("msg", `Failed for chat ${chatId}: ${errorMsg}`);
 			await ctx.reply(`Failed to process: ${errorMsg}`);
 		}
 	});

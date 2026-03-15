@@ -61,8 +61,9 @@ export function loadConfig(): Config {
 		10,
 	);
 
-	if (piModel) console.log(`[config] PI_MODEL=${piModel}`);
-	if (piThinkingLevel) console.log(`[config] PI_THINKING_LEVEL=${piThinkingLevel}`);
+	// Config logging happens after logger init via the caller
+	if (piModel) process.stdout.write(`[config] PI_MODEL=${piModel}\n`);
+	if (piThinkingLevel) process.stdout.write(`[config] PI_THINKING_LEVEL=${piThinkingLevel}\n`);
 
 	return {
 		telegramToken: token,

@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 
@@ -49,12 +50,13 @@ describe("sessions", () => {
 		telegramToken: "test-token",
 		workspace: "/mock/workspace",
 		sessionDir: "/mock/sessions",
-		thinkingLevel: "low",
 		allowedUsers: [],
 		rateLimitCooldownMs: 5000,
 		piTimeoutMs: 300000,
 		shellTimeoutMs: 60000,
 		sessionTitleTimeoutMs: 10000,
+		piModel: null,
+		piThinkingLevel: null,
 	};
 
 	beforeEach(() => {
@@ -158,7 +160,7 @@ describe("sessions", () => {
 			});
 
 			const sessions = await listSessions(mockConfig);
-			expect(sessions[0].path).toBe("/mock/sessions/telegram-123.jsonl");
+			expect(sessions[0].path).toBe(join("/mock/sessions", "telegram-123.jsonl"));
 		});
 
 		it("should include file size", async () => {
@@ -359,8 +361,8 @@ describe("sessions", () => {
 
 			expect(result).toBe("telegram-123-2024-01-15T12-30-45-678Z.jsonl");
 			expect(mockRename).toHaveBeenCalledWith(
-				"/mock/sessions/telegram-123.jsonl",
-				"/mock/sessions/telegram-123-2024-01-15T12-30-45-678Z.jsonl",
+				join("/mock/sessions", "telegram-123.jsonl"),
+				join("/mock/sessions", "telegram-123-2024-01-15T12-30-45-678Z.jsonl"),
 			);
 		});
 
@@ -681,8 +683,8 @@ describe("sessions", () => {
 			await switchSession(mockConfig, 123, "target-session.jsonl");
 
 			expect(mockCopyFile).toHaveBeenCalledWith(
-				"/mock/sessions/target-session.jsonl",
-				"/mock/sessions/telegram-123.jsonl",
+				join("/mock/sessions", "target-session.jsonl"),
+				join("/mock/sessions", "telegram-123.jsonl"),
 			);
 		});
 
@@ -701,8 +703,8 @@ describe("sessions", () => {
 
 			// Should archive the current session
 			expect(mockRename).toHaveBeenCalledWith(
-				"/mock/sessions/telegram-123.jsonl",
-				"/mock/sessions/telegram-123-2024-01-15T12-30-45-678Z.jsonl",
+				join("/mock/sessions", "telegram-123.jsonl"),
+				join("/mock/sessions", "telegram-123-2024-01-15T12-30-45-678Z.jsonl"),
 			);
 		});
 

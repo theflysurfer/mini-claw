@@ -9,6 +9,7 @@ import {
 	type AgentSessionEvent,
 } from "@mariozechner/pi-coding-agent";
 import type { Config } from "./config.js";
+import { logger, Timer } from "./logger.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,6 +44,7 @@ const locks = new Map<number, Promise<void>>();
 
 export async function acquireLock(chatId: number): Promise<() => void> {
 	while (locks.has(chatId)) {
+		logger.debug("lock", `Waiting for lock on chat ${chatId}`);
 		await locks.get(chatId);
 	}
 	let release: (() => void) | undefined;
@@ -60,13 +62,13 @@ export async function acquireLock(chatId: number): Promise<() => void> {
 // Shared Pi infrastructure (initialized once)
 // ---------------------------------------------------------------------------
 
-let sharedAuth: InstanceType<typeof AuthStorage> | null = null;
-let sharedModelRegistry: InstanceType<typeof ModelRegistry> | null = null;
+let sharedAuth: AuthStorage | null = null;
+let sharedModelRegistry: ModelRegistry | null = null;
 let piInitialized = false;
 
 async function ensurePiInfra(): Promise<{
-	authStorage: InstanceType<typeof AuthStorage>;
-	modelRegistry: InstanceType<typeof ModelRegistry>;
+	authStorage: AuthStorage;
+	modelRegistry: ModelRegistry;
 }> {
 	if (!sharedAuth) {
 		sharedAuth = AuthStorage.create();
@@ -82,6 +84,7 @@ async function ensurePiInfra(): Promise<{
 // ---------------------------------------------------------------------------
 
 const sessions = new Map<number, AgentSession>();
+const sessionCreating = new Map<number, Promise<AgentSession>>();
 
 function getSessionPath(config: Config, chatId: number): string {
 	return join(config.sessionDir, `telegram-${chatId}.jsonl`);
@@ -95,13 +98,35 @@ async function getOrCreateSession(
 	const existing = sessions.get(chatId);
 	if (existing) return existing;
 
+	// If already being created (e.g. preload in progress), wait for it
+	const pending = sessionCreating.get(chatId);
+	if (pending) {
+		logger.debug("pi-sdk", `Session for chat ${chatId} already loading, waiting...`);
+		return pending;
+	}
+
+	const promise = createSessionInternal(config, chatId, workspace);
+	sessionCreating.set(chatId, promise);
+	try {
+		return await promise;
+	} finally {
+		sessionCreating.delete(chatId);
+	}
+}
+
+async function createSessionInternal(
+	config: Config,
+	chatId: number,
+	workspace: string,
+): Promise<AgentSession> {
+	const timer = new Timer("pi-sdk", `session create (chat ${chatId})`);
+
 	const { authStorage, modelRegistry } = await ensurePiInfra();
+	timer.lap("infra");
+
 	const sessionPath = getSessionPath(config, chatId);
+	logger.info("pi-sdk", `Creating session for chat ${chatId}`, { cwd: workspace, sessionPath });
 
-	console.log(`[pi-sdk] Creating session for chat ${chatId} (cwd: ${workspace})`);
-	const startMs = Date.now();
-
-	// Resolve model override from config (env vars PI_MODEL / PI_THINKING_LEVEL)
 	const sessionOptions: Parameters<typeof createAgentSession>[0] = {
 		cwd: workspace,
 		sessionManager: SessionManager.open(sessionPath),
@@ -110,31 +135,56 @@ async function getOrCreateSession(
 	};
 
 	if (config.piModel) {
-		// Model format: "provider/model-id" or just "model-id" (defaults to anthropic)
 		const parts = config.piModel.split("/");
 		const provider = parts.length > 1 ? parts[0] : "anthropic";
 		const modelId = parts.length > 1 ? parts[1] : parts[0];
 		const model = modelRegistry.find(provider, modelId);
 		if (model) {
 			sessionOptions.model = model;
-			console.log(`[pi-sdk] Model override: ${provider}/${modelId}`);
+			logger.info("pi-sdk", `Model override: ${provider}/${modelId}`);
 		} else {
-			console.warn(`[pi-sdk] Model not found: ${config.piModel}, using default`);
+			logger.warn("pi-sdk", `Model not found: ${config.piModel}, using default`);
 		}
 	}
 
 	if (config.piThinkingLevel) {
 		sessionOptions.thinkingLevel = config.piThinkingLevel as any;
-		console.log(`[pi-sdk] Thinking override: ${config.piThinkingLevel}`);
+		logger.info("pi-sdk", `Thinking override: ${config.piThinkingLevel}`);
 	}
 
-	const { session } = await createAgentSession(sessionOptions);
+	timer.lap("options");
 
-	const elapsed = Date.now() - startMs;
-	console.log(`[pi-sdk] Session for chat ${chatId} ready in ${elapsed}ms`);
+	const { session } = await createAgentSession(sessionOptions);
+	timer.done(`chat ${chatId} ready`);
 
 	sessions.set(chatId, session);
 	return session;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-load sessions at startup
+// ---------------------------------------------------------------------------
+
+export async function preloadSessions(
+	config: Config,
+	workspace: string,
+): Promise<void> {
+	if (config.allowedUsers.length === 0) {
+		logger.info("preload", "No ALLOWED_USERS configured, skipping");
+		return;
+	}
+
+	const timer = new Timer("preload", `${config.allowedUsers.length} session(s)`);
+
+	for (const userId of config.allowedUsers) {
+		try {
+			await getOrCreateSession(config, userId, workspace);
+		} catch (err: any) {
+			logger.error("preload", `Failed for user ${userId}: ${err.message}`);
+		}
+	}
+
+	timer.done("all sessions ready");
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +197,7 @@ function eventToActivity(event: AgentSessionEvent): { type: ActivityType; detail
 			const name = event.toolName || "";
 			if (/read/i.test(name)) return { type: "reading", detail: name };
 			if (/write|edit/i.test(name)) return { type: "writing", detail: name };
-			if (/bash/i.test(name)) return { type: "running", detail: String((event as any).args?.command || "").slice(0, 50) };
+			if (/bash/i.test(name)) return { type: "running", detail: String((event as any).args?.command || "").slice(0, 80) };
 			if (/search|grep|find|fast_search/i.test(name)) return { type: "searching", detail: name };
 			return { type: "working", detail: name };
 		}
@@ -165,29 +215,26 @@ function eventToActivity(event: AgentSessionEvent): { type: ActivityType; detail
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Initialize Pi SDK (call once at startup). Validates auth.
- */
 export async function initPi(): Promise<boolean> {
+	const timer = new Timer("pi-sdk", "initPi");
 	try {
 		const { authStorage, modelRegistry } = await ensurePiInfra();
+		timer.lap("infra");
 		const available = await modelRegistry.getAvailable();
+		timer.lap("getAvailable");
 		piInitialized = available.length > 0;
 		if (piInitialized) {
-			console.log(`[pi-sdk] Pi initialized: ${available.length} model(s) available`);
+			timer.done(`${available.length} model(s) available`);
 		} else {
-			console.error("[pi-sdk] No models available — run 'pi /login' to authenticate");
+			logger.error("pi-sdk", "No models available — run 'pi /login' to authenticate");
 		}
 		return piInitialized;
 	} catch (err: any) {
-		console.error(`[pi-sdk] Init failed: ${err.message}`);
+		logger.error("pi-sdk", `Init failed: ${err.message}`);
 		return false;
 	}
 }
 
-/**
- * Run a prompt (non-streaming, simple). Kept for backward compat.
- */
 export async function runPi(
 	config: Config,
 	chatId: number,
@@ -220,9 +267,6 @@ export async function runPi(
 	}
 }
 
-/**
- * Run a prompt with activity streaming (typing indicators for Telegram).
- */
 export async function runPiWithStreaming(
 	config: Config,
 	chatId: number,
@@ -231,42 +275,61 @@ export async function runPiWithStreaming(
 	onActivity: ActivityCallback,
 ): Promise<RunResult> {
 	const release = await acquireLock(chatId);
-	const startTime = Date.now();
+	const timer = new Timer("prompt", `chat ${chatId}`);
 	let lastActivity: ActivityUpdate | null = null;
+	let toolCalls = 0;
 
 	try {
 		await mkdir(config.sessionDir, { recursive: true });
 		const session = await getOrCreateSession(config, chatId, workspace);
+		timer.lap("session");
+
+		logger.info("prompt", `← "${prompt.slice(0, 120)}${prompt.length > 120 ? "..." : ""}"`, { chatId, promptLen: prompt.length });
 
 		let output = "";
 		const unsub = session.subscribe((event) => {
-			// Collect text output
+			// Collect text
 			if (event.type === "message_update") {
 				const sub = (event as any).assistantMessageEvent;
-				if (sub?.type === "text_delta") {
-					output += sub.delta;
+				if (sub?.type === "text_delta") output += sub.delta;
+			}
+
+			// Log tool calls
+			if (event.type === "tool_execution_start") {
+				toolCalls++;
+				const name = event.toolName || "?";
+				const args = JSON.stringify((event as any).args || {}).slice(0, 200);
+				logger.debug("tool", `▶ ${name} ${args}`, { chatId });
+			}
+			if (event.type === "tool_execution_end") {
+				const name = (event as any).toolName || "?";
+				const dur = (event as any).durationMs;
+				const err = (event as any).error;
+				if (err) {
+					logger.warn("tool", `✗ ${name} failed (${dur}ms): ${String(err).slice(0, 200)}`, { chatId });
+				} else {
+					logger.debug("tool", `✓ ${name} (${dur}ms)`, { chatId });
 				}
 			}
 
-			// Detect activity for Telegram typing indicator
+			// Activity for typing indicator
 			const activity = eventToActivity(event);
 			if (activity) {
-				const elapsed = Math.floor((Date.now() - startTime) / 1000);
+				const elapsed = Math.floor((Date.now() - timer["start"]) / 1000);
 				lastActivity = { ...activity, elapsed };
 				onActivity(lastActivity);
 			}
 		});
 
-		// Periodic "working" pings when no specific activity
 		const activityInterval = setInterval(() => {
-			const elapsed = Math.floor((Date.now() - startTime) / 1000);
+			const elapsed = Math.floor((Date.now() - timer["start"]) / 1000);
 			if (!lastActivity || elapsed - lastActivity.elapsed > 5) {
 				onActivity({ type: "working", detail: "", elapsed });
 			}
 		}, 5000);
 
-		// Timeout via AbortController
 		const timeoutId = setTimeout(() => {
+			logger.warn("prompt", `Timeout reached (${config.piTimeoutMs}ms), aborting`, { chatId });
 			session.abort();
 		}, config.piTimeoutMs);
 
@@ -278,12 +341,11 @@ export async function runPiWithStreaming(
 			unsub();
 		}
 
-		const totalMs = Date.now() - startTime;
-		console.log(`[pi-sdk] chat ${chatId} responded in ${totalMs}ms (${output.length}B)`);
-
+		timer.done(`${output.length}B, ${toolCalls} tools`);
 		return { output: output || "(no output)" };
 	} catch (err: any) {
 		const isTimeout = err.message?.includes("abort");
+		logger.error("prompt", `Failed for chat ${chatId}: ${err.message}`, { isTimeout });
 		return {
 			output: "",
 			error: isTimeout ? "Timeout: Pi took too long" : err.message,
@@ -293,34 +355,23 @@ export async function runPiWithStreaming(
 	}
 }
 
-/**
- * Check Pi auth (used at startup).
- * @deprecated Use initPi() instead
- */
 export async function checkPiAuth(): Promise<boolean> {
 	return initPi();
 }
 
-/**
- * Reset a chat session (for /new command).
- */
 export async function resetSession(chatId: number): Promise<void> {
 	const session = sessions.get(chatId);
 	if (session) {
+		logger.info("pi-sdk", `Resetting session for chat ${chatId}`);
 		session.dispose();
 		sessions.delete(chatId);
 	}
 }
 
-/**
- * Dispose all sessions (graceful shutdown).
- */
 export async function disposeAll(): Promise<void> {
 	for (const [chatId, session] of sessions) {
-		try {
-			session.dispose();
-		} catch {}
+		try { session.dispose(); } catch {}
 	}
 	sessions.clear();
-	console.log("[pi-sdk] All sessions disposed");
+	logger.info("pi-sdk", "All sessions disposed");
 }
