@@ -355,6 +355,52 @@ export async function runPiWithStreaming(
 	}
 }
 
+/**
+ * Run a prompt for the scheduler (no streaming/typing, just returns output).
+ */
+export async function runPiForScheduler(
+	config: Config,
+	chatId: number,
+	prompt: string,
+	workspace: string,
+): Promise<string> {
+	const release = await acquireLock(chatId);
+	const timer = new Timer("scheduler", `prompt chat ${chatId}`);
+
+	try {
+		const session = await getOrCreateSession(config, chatId, workspace);
+		timer.lap("session");
+
+		let output = "";
+		const unsub = session.subscribe((event) => {
+			if (event.type === "message_update") {
+				const sub = (event as any).assistantMessageEvent;
+				if (sub?.type === "text_delta") output += sub.delta;
+			}
+		});
+
+		const timeoutId = setTimeout(() => {
+			logger.warn("scheduler", `Timeout on chat ${chatId}, aborting`);
+			session.abort();
+		}, config.piTimeoutMs);
+
+		try {
+			await session.prompt(prompt);
+		} finally {
+			clearTimeout(timeoutId);
+			unsub();
+		}
+
+		timer.done(`${output.length}B`);
+		return output || "(no output)";
+	} catch (err: any) {
+		logger.error("scheduler", `Failed for chat ${chatId}: ${err.message}`);
+		return `Error: ${err.message}`;
+	} finally {
+		release();
+	}
+}
+
 export async function checkPiAuth(): Promise<boolean> {
 	return initPi();
 }

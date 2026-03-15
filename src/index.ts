@@ -3,7 +3,8 @@ import { mkdir } from "node:fs/promises";
 import { createBot } from "./bot.js";
 import { loadConfig } from "./config.js";
 import { initLogger, closeLogger, logger, Timer } from "./logger.js";
-import { checkPiAuth, preloadSessions } from "./pi-runner.js";
+import { checkPiAuth, preloadSessions, runPiForScheduler } from "./pi-runner.js";
+import { startScheduler, stopScheduler } from "./scheduler.js";
 import { startTranscriber, stopTranscriber } from "./transcriber.js";
 
 async function main() {
@@ -38,18 +39,30 @@ async function main() {
 		}
 	});
 
-	// Pre-load Pi sessions (non-blocking)
-	preloadSessions(config, config.workspace).catch((err) => {
-		logger.error("preload", `Failed: ${err.message}`);
-	});
-
 	// Create and start bot
 	const bot = createBot(config);
 	boot.lap("bot-created");
 
+	// Start scheduler after preload completes (needs sessions ready)
+	preloadSessions(config, config.workspace).then(() => {
+		startScheduler(
+			(chatId, prompt) => runPiForScheduler(config, chatId, prompt, config.workspace),
+			async (chatId, text) => {
+				try {
+					await bot.api.sendMessage(chatId, text);
+				} catch (err: any) {
+					logger.error("scheduler", `Failed to send message to ${chatId}: ${err.message}`);
+				}
+			},
+		);
+	}).catch((err) => {
+		logger.error("preload", `Failed: ${err.message}`);
+	});
+
 	// Graceful shutdown
 	const shutdown = () => {
 		logger.info("boot", "Shutting down...");
+		stopScheduler();
 		stopTranscriber();
 		bot.stop();
 		closeLogger();
